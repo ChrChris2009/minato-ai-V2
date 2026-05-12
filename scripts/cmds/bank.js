@@ -1,436 +1,1017 @@
 const fs = require("fs");
+const { createCanvas } = require("canvas");
+const path = require("path");
+const axios = require("axios");
 
+const API_URL = "https://hedgehog-bank-api.onrender.com/api/bank";
+const CONVERT_API_URL = "https://numbers-conversion.vercel.app/api/parse";
+const CASH_API_URL = "https://cash-api-five.vercel.app/api/cash";
+
+const pendingTimeouts = new Map();
+let pendingTransactions = new Map();
+
+const PENDING_FILE = path.join(__dirname, "pending_transactions.json");
+if (fs.existsSync(PENDING_FILE)) {
+    try {
+        const data = JSON.parse(fs.readFileSync(PENDING_FILE, "utf8"));
+        pendingTransactions = new Map(Object.entries(data));
+    } catch (e) {}
+}
+
+function savePendingTransactions() {
+    try {
+        const obj = Object.fromEntries(pendingTransactions);
+        fs.writeFileSync(PENDING_FILE, JSON.stringify(obj, null, 2));
+    } catch (e) {}
+}
+
+const VIP_FILE = path.join(__dirname, "vips.json");
+let vipList = [];
+if (fs.existsSync(VIP_FILE)) {
+    try {
+        vipList = JSON.parse(fs.readFileSync(VIP_FILE, "utf8"));
+    } catch (e) {}
+}
+function saveVIPs() {
+    fs.writeFileSync(VIP_FILE, JSON.stringify(vipList, null, 2));
+}
+
+function toBigInt(value) {
+    if (typeof value === 'bigint') return value;
+    if (value === undefined || value === null) return 0n;
+    try {
+        return BigInt(String(value).split('.')[0]);
+    } catch {
+        return 0n;
+    }
+}
+
+function isInfinity(value) {
+    if (typeof value === 'bigint') return value > BigInt("9".repeat(260));
+    return !isFinite(Number(value)) || Number(value) >= 1e260;
+}
+
+function formatBigInt(num) {
+    if (isInfinity(num)) return "∞";
+    if (num === 0n) return "0";
+    const suffixes = ["", "k", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"];
+    let i = 0;
+    let scaled = num;
+    const thousand = 1000n;
+    while (scaled >= thousand && i < suffixes.length - 1) {
+        scaled = scaled / thousand;
+        i++;
+    }
+    const remainder = i > 0 ? (num % (thousand ** BigInt(i))) / (thousand ** BigInt(i - 1)) : 0n;
+    if (i > 0 && remainder > 0n) return `${scaled}.${remainder}${suffixes[i]}`;
+    return `${scaled}${suffixes[i]}`;
+}
+
+async function formatNumber(num) {
+    if (isInfinity(num)) return "∞";
+    const bigNum = toBigInt(num);
+    try {
+        const response = await axios.get(`${CONVERT_API_URL}?number=${bigNum.toString()}`);
+        if (response.data && response.data.success) return response.data.formatted;
+    } catch (error) {}
+    return formatBigInt(bigNum);
+}
+
+async function getUserCash(userId) {
+    try {
+        const response = await axios.get(`${CASH_API_URL}/${userId}`);
+        if (response.data.success) return toBigInt(response.data.data.cash);
+    } catch (error) {
+        console.error("Cash API Error:", error.message);
+    }
+    return 0n;
+}
+
+async function updateUserCash(userId, amount) {
+    const bigAmount = toBigInt(amount);
+    try {
+        if (bigAmount >= 0n) {
+            await axios.post(`${CASH_API_URL}/${userId}/add`, { amount: bigAmount.toString() });
+        } else {
+            await axios.post(`${CASH_API_URL}/${userId}/subtract`, { amount: (-bigAmount).toString() });
+        }
+    } catch (error) {
+        console.error("Cash API Update Error:", error.message);
+    }
+}
+
+function wrapText(text, maxLineLength = 45) {
+    const lines = [];
+    let currentLine = "";
+    const words = text.split(' ');
+    for (let i = 0; i < words.length; i++) {
+        const word = words[i];
+        if ((currentLine + " " + word).length <= maxLineLength) {
+            if (currentLine === "") {
+                currentLine = word;
+            } else {
+                currentLine += " " + word;
+            }
+        } else {
+            if (currentLine) lines.push(currentLine);
+            currentLine = word;
+        }
+    }
+    if (currentLine) lines.push(currentLine);
+    return lines;
+}
+
+function formatStyledMessage(title, contentLines) {
+    let msg = `╭─────────────•┈┈\n`;
+    for (let line of contentLines) {
+        const wrapped = wrapText(line, 45);
+        for (const w of wrapped) {
+            msg += `│ ${w}\n`;
+        }
+    }
+    msg += `╰─────────────•┈┈`;
+    return msg;
+}
 
 module.exports = {
-  config: {
-    name: "bank",
-    description: "Deposit or withdraw money from the bank and earn interest",
-    guide: {
-      vi: "",
-      en: "Bank:\nInterest - Balance - Withdraw - Deposit - Transfer - Richest - Loan - Payloan - Lottery - Gamble - HighRiskInvest[hrinvest] - Heist"
+    config: {
+        name: "bank",
+        description: "Gestion bancaire complète",
+        guide: { en: "bank deposit|withdraw|balance|interest|transfer|gamble|top|card|lottery|parrainage|image|history|rob|vip" },
+        category: "economy",
+        countDown: 1,
+        role: 0,
+        author: "Itachi Soma"
     },
-    category: "game",
-    countDown: 1,
-    role: 0,
-    author: "Itachi Soma"
-  },
-  onStart: async function ({ args, message, event,api, usersData }) {
-    const { getPrefix } = global.utils;
-    const p = getPrefix(event.threadID);
 
-    const userMoney = await usersData.get(event.senderID, "money");
-    const user = parseInt(event.senderID);
-    const info = await api.getUserInfo(user);
-                        const username = info[user].name;
-    const bankData = JSON.parse(fs.readFileSync("./bank.json", "utf8"));
+    onStart: async function ({ args, message, event, api }) {
+        const { getPrefix } = global.utils;
+        const p = getPrefix(event.threadID);
+        const user = String(event.senderID);
+        const info = await api.getUserInfo(user);
+        const username = info[user]?.name || "Utilisateur";
+        let imageMode = true;
+        let bankData = null;
+        let userCardData = null;
 
-    if (!bankData[user]) {
-      bankData[user] = { bank: 0, lastInterestClaimed: Date.now() };
-      fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    }
-
-    const command = args[0]?.toLowerCase();
-    const amount = parseInt(args[1]);
-    const recipientUID = parseInt(args[2]);
-
-    switch (command) {
-      case "deposit":
-  const depositPassword = args[1];
-  const depositAmount = parseInt(args[2]);
-
-  if (!depositPassword || !depositAmount) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please provide both a password and a valid amount for deposit.🔑\n\nIf you don't set your password then set by -bank setpassword (password)\n\nExample: -bank deposit (your_password) (your_amount)");
-  }
-
-  if (bankData[user].password !== depositPassword) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Incorrect password. Please try again.🔑");
-  }
-
-  if (isNaN(depositAmount) || depositAmount <= 0) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please enter a valid deposit amount.💸");
-  }
-
-  if (userMoney < depositAmount) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You don't have the required amount✖");
-  }
-
-  bankData[user].bank += depositAmount;
-  await usersData.set(event.senderID, {
-    money: userMoney - depositAmount
-  });
-  fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-
-  return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Successfully deposited ${depositAmount}$ into your bank account.`);
-
-
-      case "withdraw":
-  const withdrawPassword = args[1]; 
-  const withdrawAmount = parseInt(args[2]); 
-
-  if (!withdrawPassword || !withdrawAmount) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please provide both a password and a valid amount for withdrawal.🔑\n\nIf you don't set your password then set by -bank setpassword (password)\n\nExample: -bank withdraw (your_password) (your_amount)");
-  }
-
-  if (bankData[user].password !== withdrawPassword) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Incorrect password. Please try again.🔑");
-  }
-
-  const balance = bankData[user].bank || 0;
-
-  if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please enter a valid withdrawal amount.💸");
-  }
-
-  if (withdrawAmount > balance) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧The requested amount is greater than the available balance in your bank account.👽");
-  }
-
-  bankData[user].bank = balance - withdrawAmount;
-  await usersData.set(event.senderID, {
-    money: userMoney + withdrawAmount
-  });
-  fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-
-  return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Successfully withdrew ${withdrawAmount}$ from your bank account.`);
-
-        case "hrinvest":
-  const investmentAmount = parseInt(args[1]);
-
-  if (isNaN(investmentAmount) || investmentAmount <= 0) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please enter a valid investment amount.💸");
-  }
-
-  const riskOutcome = Math.random() < 0.7; 
-  const potentialReturns = investmentAmount * (riskOutcome ? 2 : 0.2); 
-
-  if (riskOutcome) {
-    bankData[user].bank -= investmentAmount;
-    fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Your high-risk investment of ${investmentAmount}$ was risky, and you lost your money. 😔`);
-  } else {
-    bankData[user].bank += potentialReturns;
-    fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Congratulations! Your high-risk investment of ${investmentAmount}$ paid off, and you earned ${potentialReturns}$ in returns! 🎉`);
-  }
-        case "gamble":
-  // Vérifie si l'utilisateur atteint automatiquement le statut VIP
-  if (bankData[user].bank >= 100000000000 && bankData[user].role !== "VIP") {
-    bankData[user].role = "VIP"; // Attribue automatiquement le statut VIP
-    fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    message.reply(
-      "🎉 Congratulations! You've been added to the VIP list because your bank balance reached 100,000,000,000$! You can now access the 'gamble' feature. 👑"
-    );
-  }
-
-  // Vérifie si l'utilisateur est VIP
-  if (bankData[user].role !== "VIP") {
-    return message.reply(
-      "==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Only VIP users can access the 'gamble' feature.\n✧ Reach a bank balance of 100,000,000,000$ to unlock VIP status. 👑"
-    );
-  }
-
-  const betAmount = parseInt(args[1]);
-
-  // Vérifie si le montant du pari est valide
-  if (isNaN(betAmount) || betAmount <= 0) {
-    return message.reply(
-      "==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Please enter a valid amount to bet.💸"
-    );
-  }
-
-  // Vérifie si l'utilisateur a suffisamment d'argent pour parier
-  if (userMoney < betAmount) {
-    return message.reply(
-      "==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ You don't have enough money to place that bet. 🙅‍♂"
-    );
-  }
-
-  // Détermine si l'utilisateur gagne ou perd
-  const winChance = Math.random() < 0.5; // 50% de chance de gagner
-  if (winChance) {
-    const winnings = betAmount * 2; // Gains doublés si l'utilisateur gagne
-    bankData[user].bank += winnings;
-    await usersData.set(event.senderID, {
-      money: userMoney - betAmount + winnings
-    });
-    fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    return message.reply(
-      `==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Congratulations! You've won ${winnings}$! 🎉`
-    );
-  } else {
-    // Si l'utilisateur perd, on déduit le montant du pari
-    bankData[user].bank -= betAmount;
-    await usersData.set(event.senderID, {
-      money: userMoney - betAmount
-    });
-    fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    return message.reply(
-      `==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Oh no! You've lost ${betAmount}$ in the gamble. 😢`
-    );
-  }
-        case "heist":
-  const heistSuccessChance = 0.2; 
-  const heistWinAmount = 1000; 
-  const heistLossAmount = 500; 
-
-  const isSuccess = Math.random() < heistSuccessChance;
-
-  if (isSuccess) {
-    const winnings = heistWinAmount;
-    bankData[user].bank += winnings;
-    fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Bank heist successful! You've won ${winnings}$! 💰`);
-  } else {
-    const lossAmount = heistLossAmount;
-    bankData[user].bank -= lossAmount;
-    fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-    return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Bank heist failed! You've lost ${lossAmount}$! 😔`);
-  }
-      case "show":
-        const bankBalance = bankData[user].bank !== undefined && !isNaN(bankData[user].bank) ? bankData[user].bank : 0;
-        return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Your bank balance is: ${bankBalance}$ •\n✧To withdraw money.\n type:\n${p}Bank Withdraw 'your withdrawal amount'•\n✧To earn interest\ntype:\n${p}Bank Interest•`);
-
-      case "interest":
-        const interestRate = 0.001; 
-        const lastInterestClaimed = bankData[user].lastInterestClaimed || Date.now();
-        const currentTime = Date.now();
-        const timeDiffInSeconds = (currentTime - lastInterestClaimed) / 1000;
-        const interestEarned = bankData[user].bank * (interestRate / 970) * timeDiffInSeconds;
-        if (bankData[user].bank <= 0) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You don't have any money in your bank account to earn interest.💸🤠");
-        }
-
-        bankData[user].lastInterestClaimed = currentTime;
-        bankData[user].bank += interestEarned;
-
-        fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-
-        return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You have earned interest of ${interestEarned.toFixed(2)} $ . It has been successfully added to your account balance..✅`);
-
-    case "transfer":
-  const senderBalance = bankData[user]?.bank || 0;
-  if (isNaN(amount) || amount <= 0) {
-      return message.reply(
-          "==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Please enter a valid amount greater than 0 for the transfer. ♻"
-      );
-  }
-  if (senderBalance < amount) {
-      return message.reply(
-          "==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Insufficient funds in your bank account to complete this transfer. ✖"
-      );
-  }
-  if (isNaN(recipientUID) || recipientUID <= 0) {
-      return message.reply(
-          `==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Please provide a valid recipient ID (UID).\nExample:\n${p}bank transfer 5000 123456789`
-      );
-  }
-  if (recipientUID === user) {
-      return message.reply(
-          "==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ You cannot transfer money to yourself. 🔄"
-      );
-  }
-  if (!bankData[recipientUID]) {
-      bankData[recipientUID] = { bank: 0, lastInterestClaimed: Date.now(), password: null };
-  }
-  bankData[user].bank -= amount;
-  bankData[recipientUID].bank += amount;
-
-  try {
-      fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-  } catch (error) {
-      return message.reply(
-          "⚠️ An error occurred while updating the bank data. Please try again or contact support."
-      );
-  }
-
-  let recipientName = "Unknown User";
-  try {
-      const recipientInfo = await api.getUserInfo(recipientUID);
-      recipientName = recipientInfo[recipientUID]?.name || "Unknown User";
-  } catch (error) { }
-
-  // Message de confirmation pour les deux utilisateurs
-  const transferMsg = `==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ You have transferred ${amount}$ to:\n✧ Name: ${recipientName}\n✧ BankID: ${recipientUID}\nYour current bank balance: ${bankData[user].bank}$\n\n~ HEDGEHOG Database ✅`;
-
-  // Message de notification pour le destinataire
-  const recipientMsg = `==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ You have received ${amount}$ from:\n✧ Name: ${username}\n✧ BankID: ${user}\nYour current bank balance: ${bankData[recipientUID].bank}$\n\n~ HEDGEHOG Database ✅`;
-
-  // Envoie le message en inbox à l'expéditeur (lui-même)
-  try {
-      await api.sendMessage(transferMsg, user);
-  } catch (e) { }
-  // Envoie le message en inbox au destinataire
-  try {
-      await api.sendMessage(recipientMsg, recipientUID);
-  } catch (e) { }
-
-  // Confirme dans la conversation où la commande a été passée
-  return message.reply(transferMsg);
-
-   case "balance":
-  // Vérifier si l'utilisateur a un compte bancaire initialisé
-  if (!bankData[user]) {
-    return message.reply(
-      "==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ You do not have a bank account. Please create one by performing a transaction like 'deposit'."
-    );
-  }
-
-  // Obtenir le solde bancaire de l'utilisateur
-  const userBankBalance = bankData[user].bank || 0;
-
-  // Répondre avec le solde actuel
-  return message.reply(
-    `==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧ Your current bank balance is: ${userBankBalance}$.\n✧ To deposit money, use:\n${p}bank deposit [amount]\n✧ To withdraw money, use:\n${p}bank withdraw [amount]\n━━━━━━━━━━━━━━━━`
-  );
-
-      case "top":
-        const bankDataCp = JSON.parse(fs.readFileSync('./bank.json', 'utf8'));
-
-        const topUsers = Object.entries(bankDataCp)
-          .sort(([, a], [, b]) => b.bank - a.bank)
-          .slice(0, 25);
-
-        const output = (await Promise.all(topUsers.map(async ([userID, userData], index) => {
-          const userName = await usersData.getName(userID);
-          return `[${index + 1}. ${userName}]`;
-        }))).join('\n');
-
-        return message.reply("𝐑𝐢𝐜𝐡𝐞𝐬𝐭 𝐩𝐞𝐨𝐩𝐥𝐞 𝐢𝐧 𝐭𝐡𝐞 𝐔𝐂𝐇𝐈𝐖𝐀 𝐬𝐲𝐬𝐭𝐞𝐦👑🤴:\n" + output);
-
-        case "setpassword":
-  const newPassword = args[1];
-  if (!newPassword) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please provide a new password to set.🔑");
-  }
-  bankData[user].password = newPassword;
-  fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-  return message.reply("[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]\n━━━━━━━━━━━━━━━━\n✧Your password has been set successfully.🔑");
-
-case "changepassword":
-  const currentPassword = args[1];
-  const newPwd = args[2]; 
-
-  if (!currentPassword || !newPwd) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please provide your current password and a new password to change.🔑");
-  }
-
-  if (bankData[user].password !== currentPassword) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Incorrect current password. Please try again.🔑");
-  }
-  bankData[user].password = newPwd; 
-  feFileSync  ("./bank.json", JSON.stringify(bankData));
-  return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Your password has been changed successfully.🔑");
-
-case "removepassword":
-  if (!bankData[user].password) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You do not have a password set for your account.🔒");
-  }
-  bankData[user].password = null;
-  fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-  return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Your password has been removed successfully.🔒");
-
-
-case "loan":
-  const maxLoanAmount = 10000;
-  const userLoan = bankData[user].loan || 0;
-  const loanPayed = bankData[user].loanPayed !== undefined ? bankData[user].loanPayed : true;
-
-  if (!amount) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please enter a valid loan amount..❗");
-  }
-
-  if (amount > maxLoanAmount) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧The maximum loan amount is 10000 ‼");
-  }
-
-  if (!loanPayed && userLoan > 0) {
-    return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You cannot take a new loan until you pay off your current loan..🌚\nYour current loan to pay: ${userLoan}$`);
-  }
-
-  bankData[user].loan = userLoan + amount;
-  bankData[user].loanPayed = false;
-  bankData[user].bank += amount;
-
-  fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-
-  return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You have successfully taken a loan of ${amount}$. Please note that loans must be repaid within a certain period.😉`);
-
-          case "vip":
-        // Sous-commande : "vip list"
-        if (args[1] && args[1].toLowerCase() === "list") {
-          const bankDataCp = JSON.parse(fs.readFileSync('./bank.json', 'utf8'));
-          // Cherche tous les VIP
-          const vipUsers = Object.entries(bankDataCp)
-            .filter(([, data]) => data.role === "VIP")
-            .sort(([, a], [, b]) => (b.bank || 0) - (a.bank || 0));
-          if (vipUsers.length === 0) {
-            return message.reply("👑 Il n'y a actuellement aucun membre VIP.");
-          }
-          // Prépare la liste avec noms et ID
-          const vipList = (await Promise.all(vipUsers.map(async ([id, data], i) => {
-            let name = "Inconnu";
+        async function apiCall(endpoint, method = "GET", body = null) {
             try {
-              name = await usersData.getName(id);
-            } catch {}
-            return `[${i + 1}] ${name} (ID: ${id}) • Solde: ${data.bank || 0}$`;
-          }))).join('\n');
-          return message.reply("👑 Liste des membres VIP :\n" + vipList);
+                const options = { method, headers: { "Content-Type": "application/json" } };
+                if (body) options.body = JSON.stringify(body);
+                const response = await fetch(`${API_URL}${endpoint}`, options);
+                return await response.json();
+            } catch (error) {
+                console.error("API Error:", error);
+                return { success: false, error: error.message };
+            }
         }
 
-        // Sinon, comportement VIP habituel :
-        if (bankData[user].role === "VIP") {
-          return message.reply(
-            "🎉 You are already a VIP member! Enjoy your exclusive privileges. 👑"
-          );
+        async function getUserBankData(userId) {
+            const result = await apiCall(`/${userId}`);
+            if (result.success) return result.data;
+            return null;
         }
-        if (bankData[user].bank >= 100000000000) {
-          bankData[user].role = "VIP";
-          fs.writeFileSync("./bank.json", JSON.stringify(bankData));
-          return message.reply(
-            "🎉 Congratulations! You've been added to the VIP list because your bank balance reached 100,000,000,000$! You can now access VIP-exclusive features. 👑"
-          );
-        } else {
-          return message.reply(
-            "⛔ You need at least 100,000,000,000$ in your bank balance to become a VIP member. Keep saving! 💸"
-          );
+
+        async function createUserCard(userId) {
+            return await apiCall(`/${userId}/card`, "POST");
         }
-           case "payloan":
-  const loanBalance = bankData[user].loan || 0;
 
-  if (isNaN(amount) || amount <= 0) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Please enter a valid amount to repay your loan..❗");
-  }
+        async function updateUserBankData(userId, amount, cvv, type) {
+            if (type === "deposit") return await apiCall(`/${userId}/deposit`, "POST", { amount, cvv });
+            if (type === "withdraw") return await apiCall(`/${userId}/withdraw`, "POST", { amount, cvv });
+            return null;
+        }
 
-  if (loanBalance <= 0) {
-    return message.reply("==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You don't have any pending loan payments.😄");
-  }
+        async function getInterest(userId) {
+            return await apiCall(`/${userId}/interest`, "POST");
+        }
 
-  if (amount > loanBalance) {
-    return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧The amount required to pay off the loan is greater than your due amount. Please pay the exact amount.😊\nYour total loan: ${loanBalance}$`);
-  }
+        async function getTopUsers() {
+            return await apiCall(`/top`);
+        }
 
-  if (amount > userMoney) {
-    return message.reply(`[🏦 ==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧You do not have ${amount}$ in your balance to repay the loan.❌\nType ${p}bal\nto view your current main balance..😞`);
-  }
+        async function playLottery(userId, ticketPrice) {
+            return await apiCall(`/${userId}/lottery`, "POST", { ticketPrice });
+        }
 
-  bankData[user].loan = loanBalance - amount;
+        async function createParrainCode(userId) {
+            return await apiCall(`/${userId}/parrain/create`, "POST");
+        }
 
-  if (loanBalance - amount === 0) {
-    bankData[user].loanPayed = true;
-  }
+        async function useParrainCode(userId, code) {
+            return await apiCall(`/${userId}/parrain/use`, "POST", { code });
+        }
 
-  await usersData.set(event.senderID, {
-    money: userMoney - amount
-  });
+        async function gambleApi(userId, amount, choice) {
+            return await apiCall(`/${userId}/gamble`, "POST", { amount, choice });
+        }
 
+        async function transferApi(userId, targetId, amount, cvv) {
+            return await apiCall(`/${userId}/transfer`, "POST", { targetId, amount, cvv });
+        }
 
-  fs.writeFileSync("./bank.json", JSON.stringify(bankData));
+        async function getTransactions(userId, limit = 10) {
+            return await apiCall(`/${userId}/transactions?limit=${limit}`);
+        }
 
-  return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━━\n✧Successfully repaid ${amount}$ towards your loan.✅\n\nto check type:\n${p}bank balance\n\nAnd your current loan to pay: ${bankData[user].loan}$`);
+        function clearPendingTransaction(userId) {
+            if (pendingTimeouts.has(userId)) {
+                clearTimeout(pendingTimeouts.get(userId));
+                pendingTimeouts.delete(userId);
+            }
+            pendingTransactions.delete(userId);
+            savePendingTransactions();
+        }
 
+        bankData = await getUserBankData(user);
+        if (!bankData) bankData = { bank: 0n, lastInterestClaimed: Date.now(), card: null };
+        if (bankData.imageMode !== undefined) imageMode = bankData.imageMode;
 
-default:
-        return message.reply(`==[🏦 𝐔𝐂𝐇𝐈𝐖𝐀 𝐁𝐀𝐍𝐊 🏦]==\n━━━━━━━━━━━━━━━\n📲| 𝙿𝚕𝚎𝚊𝚜𝚎 𝚞𝚜𝚎 𝚘𝚗𝚎 𝚘𝚏 𝚝𝚑𝚎 𝚏𝚘𝚕𝚕𝚘𝚠𝚒𝚗𝚐 𝚌𝚘𝚖𝚖𝚊𝚗𝚍𝚜✧\n✰ ${p}𝐁𝐚𝐧𝐤 𝐃𝐞𝐩𝐨𝐬𝐢𝐭\n✰ ${p}𝐁𝐚𝐧𝐤 𝐖𝐢𝐭𝐡𝐝𝐫𝐚𝐰\n✰ ${p}𝐁𝐚𝐧𝐤 𝐒𝐡𝐨𝐰\n✰ ${p}𝐁𝐚𝐧𝐤 𝐈𝐧𝐭𝐞𝐫𝐞𝐬𝐭\n✰ ${p}𝐁𝐚𝐧𝐤 𝐓𝐫𝐚𝐧𝐬𝐟𝐞𝐫\n✰ ${p}𝐁𝐚𝐧𝐤 𝐓𝐨𝐩\n✰ ${p}𝐁𝐚𝐧𝐤 𝐋𝐨𝐚𝐧\n✰ ${p}𝐁𝐚𝐧𝐤 𝐏𝐚𝐲𝐥𝐨𝐚𝐧\n✰ ${p}𝐁𝐚𝐧𝐤 𝐇𝐫𝐢𝐧𝐯𝐞𝐬𝐭\n✰ ${p}𝐁𝐚𝐧𝐤 𝐆𝐚𝐦𝐛𝐥𝐞\n✰ ${p}𝐁𝐚𝐧𝐤 𝐇𝐞𝐢𝐬𝐭\n✰ ${p}𝐁𝐚𝐧𝐤 𝐁𝐚𝐥𝐚𝐧𝐜𝐞\n✰ ${p}𝐁𝐚𝐧𝐤 𝐕𝐈𝐏\n━━━━━━━━━━━━━━━━\n ===[🏦 𝗣𝗔𝗦𝗦𝗪𝗢𝗥𝗗 🏦]===\n✧𝙿𝚕𝚎𝚊𝚜𝚎 𝚊𝚍𝚍 𝚙𝚊𝚜𝚜𝚠𝚘𝚛𝚍 𝚏𝚘𝚛 𝚜𝚎𝚌𝚞𝚛𝚎 𝚊𝚌𝚌𝚘𝚞𝚗𝚝✧\n✰ ${p}𝗕𝗮𝗻𝗸 𝘀𝗲𝘁𝗽𝗮𝘀𝘀𝘄𝗼𝗿𝗱\n✰ ${p}𝗕𝗮𝗻𝗸 𝗰𝗵𝗮𝗻𝗴𝗲𝗽𝗮𝘀𝘀𝘄𝗼𝗿𝗱\n✰ ${p}𝗕𝗮𝗻𝗸 𝗿𝗲𝗺𝗼𝘃𝗲𝗽𝗮𝘀𝘀𝘄𝗼𝗿𝗱\n━━━━━━━━━━━━━━━━`);
+        const command = args[0]?.toLowerCase();
+
+        async function parseAmountWithSuffix(input) {
+            if (!input) return 0n;
+            try {
+                const response = await fetch(`${CONVERT_API_URL}?input=${encodeURIComponent(input)}`);
+                const data = await response.json();
+                if (data.success && data.result) return toBigInt(data.result);
+            } catch (error) {}
+            const str = String(input).toLowerCase().trim();
+            const SUFFIXES = {
+                'k': 1000n, 'm': 1000000n, 'b': 1000000000n, 't': 1000000000000n,
+                'q': 1000000000000000n, 'Q': 1000000000000000000n,
+                's': 1000000000000000000000n, 'S': 1000000000000000000000000n,
+                'o': 1000000000000000000000000000n, 'n': 1000000000000000000000000000000n,
+                'd': 1000000000000000000000000000000000n
+            };
+            const match = str.match(/^(\d+(?:\.\d+)?)([a-z]?)$/i);
+            if (!match) return 0n;
+            let value = parseFloat(match[1]);
+            const suffix = match[2]?.toLowerCase();
+            if (isNaN(value)) return 0n;
+            if (suffix && SUFFIXES[suffix]) return toBigInt(Math.floor(value)) * SUFFIXES[suffix];
+            return toBigInt(Math.floor(value));
+        }
+
+        async function formatNumberAsync(num) {
+            return formatNumber(num);
+        }
+
+        async function getUserDisplayName(uid) {
+            try { const u = await api.getUserInfo(uid); return u[uid]?.name || uid; } catch(e) { return uid; }
+        }
+
+        async function generateBankCard(title, balance, messageText, username, cvv = null, cardData = null) {
+            const canvas = createCanvas(600, 420);
+            const ctx = canvas.getContext("2d");
+            const gradient = ctx.createLinearGradient(0, 0, 600, 420);
+            gradient.addColorStop(0, "#1a1a2e");
+            gradient.addColorStop(0.5, "#16213e");
+            gradient.addColorStop(1, "#0f3460");
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 600, 420);
+            ctx.strokeStyle = "#d4af37";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(10, 10, 580, 400);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 20px 'Courier New'";
+            ctx.fillText("HEDGEHOG BANK", 30, 55);
+            ctx.font = "10px 'Courier New'";
+            ctx.fillStyle = "#aaa";
+            ctx.fillText("PREMIUM CARD", 30, 75);
+            ctx.fillStyle = "#d4af37";
+            ctx.fillRect(440, 40, 50, 35);
+            ctx.fillStyle = "#b8960c";
+            ctx.fillRect(445, 45, 40, 25);
+            ctx.fillStyle = "#e0e0e0";
+            ctx.font = "22px 'Courier New'";
+            let cardNumber = cardData?.cardNumber || "**** **** **** " + Math.floor(Math.random() * 9000 + 1000);
+            ctx.fillText(cardNumber, 30, 165);
+            ctx.fillStyle = "#fff";
+            ctx.font = "14px 'Courier New'";
+            const expiry = cardData?.cardExpiry || "12/28";
+            ctx.fillText(expiry, 120, 200);
+            ctx.font = "12px 'Courier New'";
+            ctx.fillStyle = "#ccc";
+            ctx.fillText("VALID THRU", 30, 200);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 16px 'Courier New'";
+            ctx.fillText(title.toUpperCase(), 380, 210);
+            const cardHolder = username.toUpperCase().substring(0, 20);
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 14px 'Courier New'";
+            ctx.fillText(cardHolder, 30, 250);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText("CARDHOLDER", 30, 265);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 28px 'Courier New'";
+            ctx.fillText(`${await formatNumberAsync(balance)}`, 30, 315);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText("CURRENT BALANCE", 30, 335);
+            ctx.fillStyle = "#88ff88";
+            ctx.font = "12px 'Courier New'";
+            const lines = messageText.split('\n');
+            let y = 300;
+            for (let i = 0; i < Math.min(lines.length, 3); i++) {
+                ctx.fillStyle = i === 0 ? "#88ff88" : "#ccc";
+                ctx.fillText(lines[i], 350, y);
+                y += 20;
+            }
+            if (cvv) {
+                ctx.fillStyle = "#d4af37";
+                ctx.font = "bold 14px 'Courier New'";
+                ctx.fillText(cvv.toString(), 540, 100);
+            }
+            const date = new Date();
+            const dateStr = `${date.getDate()}/${date.getMonth()+1}/${date.getFullYear()}`;
+            ctx.fillStyle = "#666";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText(dateStr, 30, 395);
+            return canvas.toBuffer();
+        }
+
+        async function generateLotteryCard(username, ticketPrice, win, winAmount, numbers, drawnNumbers, matchCount) {
+            const canvas = createCanvas(600, 420);
+            const ctx = canvas.getContext("2d");
+            const gradient = ctx.createLinearGradient(0, 0, 600, 420);
+            gradient.addColorStop(0, "#1a1a2e");
+            gradient.addColorStop(0.5, "#16213e");
+            gradient.addColorStop(1, "#0f3460");
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 600, 420);
+            ctx.strokeStyle = "#d4af37";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(10, 10, 580, 400);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 20px 'Courier New'";
+            ctx.fillText("HEDGEHOG LOTTERY", 30, 55);
+            ctx.font = "10px 'Courier New'";
+            ctx.fillStyle = "#aaa";
+            ctx.fillText("LUCKY DRAW", 30, 75);
+            ctx.fillStyle = "#d4af37";
+            ctx.fillRect(480, 35, 45, 30);
+            ctx.fillStyle = "#b8960c";
+            ctx.fillRect(484, 39, 37, 22);
+            const cardHolder = username.toUpperCase().substring(0, 18);
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 12px 'Courier New'";
+            ctx.fillText(cardHolder, 30, 110);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText("PLAYER", 30, 125);
+            ctx.fillStyle = "#ffd700";
+            ctx.font = "bold 18px 'Courier New'";
+            ctx.fillText("NUMEROS TIRES", 380, 110);
+            ctx.fillStyle = "#fff";
+            ctx.font = "24px 'Courier New'";
+            ctx.fillText(numbers.join(" - "), 380, 150);
+            ctx.fillStyle = "#ffd700";
+            ctx.font = "bold 18px 'Courier New'";
+            ctx.fillText("RESULTAT", 380, 200);
+            ctx.fillStyle = "#fff";
+            ctx.font = "24px 'Courier New'";
+            ctx.fillText(drawnNumbers.join(" - "), 380, 240);
+            ctx.fillStyle = "#88ff88";
+            ctx.font = "bold 14px 'Courier New'";
+            ctx.fillText(`CORRESPONDANCES: ${matchCount}`, 380, 290);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 28px 'Courier New'";
+            ctx.fillText(`${await formatNumberAsync(bankData?.bank || 0n)}$`, 30, 315);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText("NEW BALANCE", 30, 340);
+            if (win) {
+                ctx.fillStyle = "#00ff88";
+                ctx.font = "bold 16px 'Courier New'";
+                ctx.fillText(`GAIN: +${await formatNumberAsync(winAmount)}$`, 380, 340);
+            } else {
+                ctx.fillStyle = "#ff4444";
+                ctx.font = "bold 16px 'Courier New'";
+                ctx.fillText(`PERTE: -${await formatNumberAsync(ticketPrice)}$`, 380, 340);
+            }
+            const date = new Date();
+            const dateStr = `${date.getDate()}/${date.getMonth()+1}/${date.getFullYear()}`;
+            ctx.fillStyle = "#666";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText(dateStr, 30, 395);
+            return canvas.toBuffer();
+        }
+
+        async function generateParrainCard(username, code, count, gains, type) {
+            const canvas = createCanvas(600, 420);
+            const ctx = canvas.getContext("2d");
+            const gradient = ctx.createLinearGradient(0, 0, 600, 420);
+            gradient.addColorStop(0, "#1a1a2e");
+            gradient.addColorStop(0.5, "#16213e");
+            gradient.addColorStop(1, "#0f3460");
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 600, 420);
+            ctx.strokeStyle = "#d4af37";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(10, 10, 580, 400);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 20px 'Courier New'";
+            ctx.fillText("HEDGEHOG PARRAINAGE", 30, 55);
+            ctx.font = "10px 'Courier New'";
+            ctx.fillStyle = "#aaa";
+            ctx.fillText("REFERRAL", 30, 75);
+            ctx.fillStyle = "#d4af37";
+            ctx.fillRect(480, 35, 45, 30);
+            ctx.fillStyle = "#b8960c";
+            ctx.fillRect(484, 39, 37, 22);
+            const cardHolder = username.toUpperCase().substring(0, 18);
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 12px 'Courier New'";
+            ctx.fillText(cardHolder, 30, 110);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText("PLAYER", 30, 125);
+            ctx.fillStyle = "#ffd700";
+            ctx.font = "bold 18px 'Courier New'";
+            if (type === "create") {
+                ctx.fillText("CODE CREE", 380, 110);
+                ctx.fillStyle = "#fff";
+                ctx.font = "24px 'Courier New'";
+                ctx.fillText(code, 380, 160);
+                ctx.fillStyle = "#88ff88";
+                ctx.font = "14px 'Courier New'";
+                ctx.fillText("Partagez ce code !", 380, 210);
+            } else if (type === "stats") {
+                ctx.fillText("STATISTIQUES", 380, 110);
+                ctx.fillStyle = "#fff";
+                ctx.font = "16px 'Courier New'";
+                ctx.fillText(`Code: ${code}`, 380, 160);
+                ctx.fillText(`Parraines: ${count}`, 380, 190);
+                ctx.fillText(`Gains: ${await formatNumberAsync(gains)}$`, 380, 220);
+            } else if (type === "use") {
+                ctx.fillText("CODE UTILISE", 380, 110);
+                ctx.fillStyle = "#fff";
+                ctx.font = "20px 'Courier New'";
+                ctx.fillText(code, 380, 160);
+                ctx.fillStyle = "#88ff88";
+                ctx.font = "14px 'Courier New'";
+                ctx.fillText(`Bonus: +10000$`, 380, 210);
+            }
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 28px 'Courier New'";
+            ctx.fillText(`${await formatNumberAsync(bankData?.bank || 0n)}$`, 30, 315);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText("NEW BALANCE", 30, 340);
+            const date = new Date();
+            const dateStr = `${date.getDate()}/${date.getMonth()+1}/${date.getFullYear()}`;
+            ctx.fillStyle = "#666";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText(dateStr, 30, 395);
+            return canvas.toBuffer();
+        }
+
+        async function generateGambleCard(username, amount, win, winAmount, choice, result) {
+            const canvas = createCanvas(600, 420);
+            const ctx = canvas.getContext("2d");
+            const gradient = ctx.createLinearGradient(0, 0, 600, 420);
+            gradient.addColorStop(0, "#1a1a2e");
+            gradient.addColorStop(0.5, "#16213e");
+            gradient.addColorStop(1, "#0f3460");
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 600, 420);
+            ctx.strokeStyle = "#d4af37";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(10, 10, 580, 400);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 20px 'Courier New'";
+            ctx.fillText("HEDGEHOG CASINO", 30, 55);
+            ctx.font = "10px 'Courier New'";
+            ctx.fillStyle = "#aaa";
+            ctx.fillText("PILE OU FACE", 30, 75);
+            ctx.fillStyle = "#d4af37";
+            ctx.fillRect(480, 35, 45, 30);
+            ctx.fillStyle = "#b8960c";
+            ctx.fillRect(484, 39, 37, 22);
+            const cardHolder = username.toUpperCase().substring(0, 18);
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 12px 'Courier New'";
+            ctx.fillText(cardHolder, 30, 110);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText("JOUEUR", 30, 125);
+            ctx.fillStyle = "#ffd700";
+            ctx.font = "bold 18px 'Courier New'";
+            ctx.fillText("VOTRE CHOIX", 380, 110);
+            ctx.fillStyle = "#fff";
+            ctx.font = "24px 'Courier New'";
+            ctx.fillText(choice === "pile" ? "🪙 PILE" : "🪙 FACE", 380, 150);
+            ctx.fillStyle = "#ffd700";
+            ctx.font = "bold 18px 'Courier New'";
+            ctx.fillText("RESULTAT", 380, 200);
+            ctx.fillStyle = "#fff";
+            ctx.font = "24px 'Courier New'";
+            ctx.fillText(result === "pile" ? "🪙 PILE" : "🪙 FACE", 380, 240);
+            ctx.fillStyle = "#88ff88";
+            ctx.font = "bold 14px 'Courier New'";
+            ctx.fillText(win ? "🎉 GAGNE !" : "💀 PERDU !", 380, 290);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 28px 'Courier New'";
+            ctx.fillText(`${await formatNumberAsync(bankData?.bank || 0n)}$`, 30, 315);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText("NEW BALANCE", 30, 340);
+            if (win) {
+                ctx.fillStyle = "#00ff88";
+                ctx.font = "bold 16px 'Courier New'";
+                ctx.fillText(`GAIN: +${await formatNumberAsync(winAmount)}$`, 380, 340);
+            } else {
+                ctx.fillStyle = "#ff4444";
+                ctx.font = "bold 16px 'Courier New'";
+                ctx.fillText(`PERTE: -${await formatNumberAsync(amount)}$`, 380, 340);
+            }
+            const date = new Date();
+            const dateStr = `${date.getDate()}/${date.getMonth()+1}/${date.getFullYear()}`;
+            ctx.fillStyle = "#666";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText(dateStr, 30, 395);
+            return canvas.toBuffer();
+        }
+
+        async function generateTransferCard(username, targetName, amount, newBalance) {
+            const canvas = createCanvas(600, 420);
+            const ctx = canvas.getContext("2d");
+            const gradient = ctx.createLinearGradient(0, 0, 600, 420);
+            gradient.addColorStop(0, "#1a1a2e");
+            gradient.addColorStop(0.5, "#16213e");
+            gradient.addColorStop(1, "#0f3460");
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 600, 420);
+            ctx.strokeStyle = "#d4af37";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(10, 10, 580, 400);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 20px 'Courier New'";
+            ctx.fillText("HEDGEHOG BANK", 30, 55);
+            ctx.font = "10px 'Courier New'";
+            ctx.fillStyle = "#aaa";
+            ctx.fillText("TRANSFERT", 30, 75);
+            ctx.fillStyle = "#e0e0e0";
+            ctx.font = "22px 'Courier New'";
+            ctx.fillText("**** **** **** 4532", 30, 165);
+            ctx.font = "12px 'Courier New'";
+            ctx.fillStyle = "#ccc";
+            ctx.fillText("VALID THRU", 30, 200);
+            ctx.fillStyle = "#fff";
+            ctx.font = "14px 'Courier New'";
+            ctx.fillText("12/28", 120, 200);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 16px 'Courier New'";
+            ctx.fillText("TRANSFER", 380, 210);
+            const cardHolder = username.toUpperCase().substring(0, 20);
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 14px 'Courier New'";
+            ctx.fillText(cardHolder, 30, 250);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText("EXPEDITEUR", 30, 265);
+            ctx.fillStyle = "#d4af37";
+            ctx.font = "bold 28px 'Courier New'";
+            ctx.fillText(`${await formatNumberAsync(newBalance)}$`, 30, 315);
+            ctx.fillStyle = "#aaa";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText("NOUVEAU SOLDE", 30, 335);
+            ctx.fillStyle = "#88ff88";
+            ctx.font = "12px 'Courier New'";
+            ctx.fillText(`Destinataire: ${targetName}`, 350, 300);
+            ctx.fillText(`Montant: -${await formatNumberAsync(amount)}$`, 350, 320);
+            const date = new Date();
+            const dateStr = `${date.getDate()}/${date.getMonth()+1}/${date.getFullYear()}`;
+            ctx.fillStyle = "#666";
+            ctx.font = "9px 'Courier New'";
+            ctx.fillText(dateStr, 30, 395);
+            return canvas.toBuffer();
+        }
+
+        if (command === "vip") {
+            const sub = args[1]?.toLowerCase();
+            if (!sub || sub === "help") {
+                const helpLines = [
+                    "👑 VIP MANAGEMENT",
+                    `✰ ${p}bank vip -a <uid> → Ajouter un VIP`,
+                    `✰ ${p}bank vip -r <uid> → Retirer un VIP`,
+                    `✰ ${p}bank vip list → Liste des VIP`,
+                    "⚠️ Seul l'ID 61589149033077 peut modifier."
+                ];
+                return message.reply(formatStyledMessage("", helpLines));
+            }
+            const adminVip = "61589149033077";
+            if (user !== adminVip) {
+                return message.reply(formatStyledMessage("", ["❌ Vous n'êtes pas autorisé à gérer les VIP."]));
+            }
+            if (sub === "-a") {
+                const targetUid = args[2];
+                if (!targetUid) return message.reply(formatStyledMessage("", ["❌ UID manquant."]));
+                const targetName = await getUserDisplayName(targetUid);
+                if (!vipList.includes(targetUid)) {
+                    vipList.push(targetUid);
+                    saveVIPs();
+                    return message.reply(formatStyledMessage("", [`✅ ${targetName} (${targetUid}) a été ajouté à la liste VIP.`]));
+                } else {
+                    return message.reply(formatStyledMessage("", [`⚠️ ${targetName} (${targetUid}) est déjà VIP.`]));
+                }
+            } else if (sub === "-r") {
+                const targetUid = args[2];
+                if (!targetUid) return message.reply(formatStyledMessage("", ["❌ UID manquant."]));
+                const targetName = await getUserDisplayName(targetUid);
+                const idx = vipList.indexOf(targetUid);
+                if (idx !== -1) {
+                    vipList.splice(idx, 1);
+                    saveVIPs();
+                    return message.reply(formatStyledMessage("", [`✅ ${targetName} (${targetUid}) a été retiré de la liste VIP.`]));
+                } else {
+                    return message.reply(formatStyledMessage("", [`⚠️ ${targetName} (${targetUid}) n'est pas VIP.`]));
+                }
+            } else if (sub === "list") {
+                if (vipList.length === 0) return message.reply(formatStyledMessage("", ["📋 Aucun VIP pour l'instant."]));
+                let lines = ["👑 LISTE DES VIP"];
+                for (let i = 0; i < vipList.length; i++) {
+                    const name = await getUserDisplayName(vipList[i]);
+                    lines.push(`${i+1}. ${name} (${vipList[i]})`);
+                }
+                return message.reply(formatStyledMessage("", lines));
+            }
+        }
+
+        if (command === "rob") {
+            if (!vipList.includes(user)) {
+                return message.reply(formatStyledMessage("", ["❌ Seuls les VIP peuvent utiliser la commande `bank rob`."]));
+            }
+            let targetUid;
+            if (Object.keys(event.mentions).length > 0) targetUid = Object.keys(event.mentions)[0];
+            else targetUid = args[1];
+            if (!targetUid) return message.reply(formatStyledMessage("", ["❌ Mentionnez ou entrez l'UID de la cible."]));
+            if (targetUid === user) return message.reply(formatStyledMessage("", ["❌ Vous ne pouvez pas vous voler vous-même."]));
+            const targetBank = await getUserBankData(targetUid);
+            if (!targetBank || targetBank.bank <= 0) return message.reply(formatStyledMessage("", ["❌ Cette personne n'a pas d'argent en banque."]));
+            let robAmount = await parseAmountWithSuffix(args[2]);
+            if (robAmount <= 0n) {
+                const rand = Number(targetBank.bank) * (Math.random() * 0.2 + 0.1);
+                robAmount = toBigInt(Math.floor(rand));
+                if (robAmount <= 0n) robAmount = 1n;
+            }
+            if (robAmount > targetBank.bank) robAmount = targetBank.bank;
+            const success = Math.random() < 0.5;
+            if (!success) {
+                return message.reply(formatStyledMessage("", [`💀 Échec du vol ! Vous avez tenté de voler ${await formatNumberAsync(robAmount)}$ mais vous vous êtes fait prendre.`]));
+            }
+            const transferResult = await transferApi(user, targetUid, Number(robAmount), bankData.card?.cardCvv);
+            if (transferResult && transferResult.success) {
+                bankData = await getUserBankData(user);
+                const successMsg = [`🦹‍♂️ Vol réussi !`, `💸 Vous avez volé ${await formatNumberAsync(robAmount)}$ à ${targetUid}.`, `💰 Nouveau solde : ${await formatNumberAsync(bankData.bank)}$`];
+                if (imageMode !== false) {
+                    const img = await generateBankCard("ROB", `${await formatNumberAsync(bankData.bank)}$`, `+ ${await formatNumberAsync(robAmount)}$ (vol)`, username);
+                    const imgPath = `./bank_rob_${user}.png`;
+                    fs.writeFileSync(imgPath, img);
+                    await message.reply({ body: formatStyledMessage("", successMsg), attachment: fs.createReadStream(imgPath) });
+                    fs.unlinkSync(imgPath);
+                } else await message.reply(formatStyledMessage("", successMsg));
+            } else return message.reply(formatStyledMessage("", ["❌ Le vol a échoué à cause d'une erreur technique."]));
+            return;
+        }
+
+        if (command === "history") {
+            const limit = parseInt(args[1]) || 10;
+            const histResult = await getTransactions(user, limit);
+            if (histResult.success && histResult.data.length > 0) {
+                let lines = ["📜 HISTORIQUE DES TRANSACTIONS"];
+                for (const tx of histResult.data.slice(0, limit)) {
+                    const date = new Date(tx.date).toLocaleString();
+                    let amountStr = tx.amount >= 0 ? `+${await formatNumberAsync(tx.amount)}$` : `${await formatNumberAsync(tx.amount)}$`;
+                    let rawLine = `📌 ${tx.type} : ${amountStr} (${date})`;
+                    const wrappedLines = wrapText(rawLine, 45);
+                    for (const wl of wrappedLines) {
+                        lines.push(wl);
+                    }
+                }
+                return message.reply(formatStyledMessage("", lines));
+            } else return message.reply(formatStyledMessage("", ["📭 Aucune transaction trouvée."]));
+        }
+
+        const pending = pendingTransactions.get(user);
+        if (pending && !isNaN(parseInt(command))) {
+            const userCvv = parseInt(command);
+            if (!isNaN(userCvv)) {
+                clearPendingTransaction(user);
+                const cardCvv = bankData.card?.cardCvv;
+                if (userCvv !== cardCvv) return message.reply(formatStyledMessage("", ["❌ CVV incorrect !"]));
+                const amount = pending.amount;
+                const type = pending.type;
+                if (type === "deposit") {
+                    const currentUserMoney = await getUserCash(event.senderID);
+                    if (amount > currentUserMoney) return message.reply(formatStyledMessage("", ["❌ Solde cash insuffisant."]));
+                    const depositResult = await updateUserBankData(user, Number(amount), userCvv, "deposit");
+                    if (depositResult?.success) {
+                        bankData = await getUserBankData(user);
+                        await updateUserCash(event.senderID, -amount);
+                        const txt = `✅ Dépôt de ${await formatNumberAsync(amount)}$ effectué ! Nouveau solde: ${await formatNumberAsync(bankData.bank)}$`;
+                        if (imageMode !== false) {
+                            const img = await generateBankCard("DEPOSIT", `${await formatNumberAsync(bankData.bank)}$`, `+ ${await formatNumberAsync(amount)}$`, username);
+                            const imgPath = `./bank_deposit_${user}.png`;
+                            fs.writeFileSync(imgPath, img);
+                            await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                            fs.unlinkSync(imgPath);
+                        } else await message.reply(formatStyledMessage("", [txt]));
+                    } else return message.reply(formatStyledMessage("", ["❌ Erreur dépôt."]));
+                } else if (type === "withdraw") {
+                    const currentBalance = bankData.bank || 0n;
+                    if (amount > currentBalance) return message.reply(formatStyledMessage("", ["❌ Solde bancaire insuffisant."]));
+                    const withdrawResult = await updateUserBankData(user, Number(amount), userCvv, "withdraw");
+                    if (withdrawResult?.success) {
+                        bankData = await getUserBankData(user);
+                        await updateUserCash(event.senderID, amount);
+                        const txt = `💸 Retrait de ${await formatNumberAsync(amount)}$ effectué ! Nouveau solde: ${await formatNumberAsync(bankData.bank)}$`;
+                        if (imageMode !== false) {
+                            const img = await generateBankCard("WITHDRAW", `${await formatNumberAsync(bankData.bank)}$`, `- ${await formatNumberAsync(amount)}$`, username);
+                            const imgPath = `./bank_withdraw_${user}.png`;
+                            fs.writeFileSync(imgPath, img);
+                            await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                            fs.unlinkSync(imgPath);
+                        } else await message.reply(formatStyledMessage("", [txt]));
+                    } else return message.reply(formatStyledMessage("", ["❌ Erreur retrait."]));
+                } else if (type === "transfer") {
+                    const currentBalance = bankData.bank || 0n;
+                    if (amount > currentBalance) return message.reply(formatStyledMessage("", ["❌ Solde bancaire insuffisant."]));
+                    const transferResult = await transferApi(user, pending.targetId, Number(amount), userCvv);
+                    if (transferResult?.success) {
+                        bankData = await getUserBankData(user);
+                        const txt = `💸 Transfert de ${await formatNumberAsync(amount)}$ vers ${pending.targetName} réussi ! Nouveau solde: ${await formatNumberAsync(bankData.bank)}$`;
+                        if (imageMode !== false) {
+                            const img = await generateTransferCard(username, pending.targetName, amount, bankData.bank);
+                            const imgPath = `./bank_transfer_${user}.png`;
+                            fs.writeFileSync(imgPath, img);
+                            await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                            fs.unlinkSync(imgPath);
+                        } else await message.reply(formatStyledMessage("", [txt]));
+                    } else return message.reply(formatStyledMessage("", ["❌ Erreur transfert."]));
+                }
+                return;
+            }
+        }
+
+        switch (command) {
+            case "deposit":
+                const depositAmount = await parseAmountWithSuffix(args[1]);
+                if (depositAmount <= 0n) return message.reply(formatStyledMessage("", ["❌ Montant invalide.", `   Utilisation: ${p}bank deposit <montant>`]));
+                if (!bankData.card?.cardCreated) return message.reply(formatStyledMessage("", [`❌ Créez d'abord une carte avec ${p}bank card`]));
+                clearPendingTransaction(user);
+                pendingTransactions.set(user, { amount: depositAmount, type: "deposit" });
+                savePendingTransactions();
+                const to1 = setTimeout(() => { if (pendingTransactions.has(user)) { pendingTransactions.delete(user); savePendingTransactions(); message.reply(formatStyledMessage("", ["⏰ Transaction expirée."])); } pendingTimeouts.delete(user); }, 15000);
+                pendingTimeouts.set(user, to1);
+                return message.reply(formatStyledMessage("", [`💳 Transaction de ${await formatNumberAsync(depositAmount)}$`, `🔐 Entrez votre CVV (ex: bank 123) [15s]`]));
+
+            case "withdraw":
+                const withdrawAmount = await parseAmountWithSuffix(args[1]);
+                if (withdrawAmount <= 0n) return message.reply(formatStyledMessage("", ["❌ Montant invalide.", `   Utilisation: ${p}bank withdraw <montant>`]));
+                if (!bankData.card?.cardCreated) return message.reply(formatStyledMessage("", [`❌ Créez d'abord une carte.`]));
+                if ((bankData.bank || 0n) < withdrawAmount) return message.reply(formatStyledMessage("", ["❌ Solde bancaire insuffisant."]));
+                clearPendingTransaction(user);
+                pendingTransactions.set(user, { amount: withdrawAmount, type: "withdraw" });
+                savePendingTransactions();
+                const to2 = setTimeout(() => { if (pendingTransactions.has(user)) { pendingTransactions.delete(user); savePendingTransactions(); message.reply(formatStyledMessage("", ["⏰ Transaction expirée."])); } pendingTimeouts.delete(user); }, 15000);
+                pendingTimeouts.set(user, to2);
+                return message.reply(formatStyledMessage("", [`💳 Transaction de ${await formatNumberAsync(withdrawAmount)}$`, `🔐 Entrez votre CVV (ex: bank 123) [15s]`]));
+
+            case "balance":
+            case "show": {
+                const bal = bankData.bank || 0n;
+                const txt = `💰 Solde bancaire : ${await formatNumberAsync(bal)}$`;
+                if (imageMode !== false) {
+                    const img = await generateBankCard("BALANCE", `${await formatNumberAsync(bal)}$`, "Disponible", username);
+                    const imgPath = `./bank_balance_${user}.png`;
+                    fs.writeFileSync(imgPath, img);
+                    await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                    fs.unlinkSync(imgPath);
+                } else await message.reply(formatStyledMessage("", [txt]));
+                break;
+            }
+
+            case "interest": {
+                if ((bankData.bank || 0n) <= 0n) return message.reply(formatStyledMessage("", ["❌ Pas d'argent en banque."]));
+                const interestRes = await getInterest(user);
+                if (interestRes.success) {
+                    bankData = await getUserBankData(user);
+                    const earned = toBigInt(interestRes.interestEarned);
+                    const txt = `📈 Intérêts crédités : ${await formatNumberAsync(earned)}$\n💰 Nouveau solde : ${await formatNumberAsync(bankData.bank)}$`;
+                    const lines = txt.split('\n');
+                    if (imageMode !== false) {
+                        const img = await generateBankCard("INTEREST", `${await formatNumberAsync(bankData.bank)}$`, `+ ${await formatNumberAsync(earned)}$`, username);
+                        const imgPath = `./bank_interest_${user}.png`;
+                        fs.writeFileSync(imgPath, img);
+                        await message.reply({ body: formatStyledMessage("", lines), attachment: fs.createReadStream(imgPath) });
+                        fs.unlinkSync(imgPath);
+                    } else await message.reply(formatStyledMessage("", lines));
+                } else return message.reply(formatStyledMessage("", [`❌ ${interestRes.error}`]));
+                break;
+            }
+
+            case "top":
+            case "richest": {
+                const topRes = await getTopUsers();
+                if (topRes.success && topRes.data.length > 0) {
+                    let lines = ["👑 CLASSEMENT BANCAIRE"];
+                    for (let i = 0; i < Math.min(topRes.data.length, 25); i++) {
+                        const u = topRes.data[i];
+                        let name = u.userId;
+                        try { const ui = await api.getUserInfo(u.userId); name = ui[u.userId]?.name || u.userId; } catch(e) {}
+                        const line = `${i+1}. ${name} - ${await formatNumberAsync(u.bank || 0)}$`;
+                        const wrapped = wrapText(line, 45);
+                        for (const w of wrapped) lines.push(w);
+                    }
+                    return message.reply(formatStyledMessage("", lines));
+                } else return message.reply(formatStyledMessage("", ["📊 Aucun utilisateur enregistré."]));
+                break;
+            }
+
+            case "card": {
+                const cardRes = await createUserCard(user);
+                if (cardRes.success) {
+                    userCardData = cardRes.data;
+                    bankData.card = userCardData;
+                    const cvvMsg = `💳 Carte créée ! N°: ${userCardData.cardNumber}, Exp: ${userCardData.cardExpiry}, CVV: ${userCardData.cardCvv}`;
+                    if (imageMode !== false) {
+                        const img = await generateBankCard("CARD", `${await formatNumberAsync(bankData.bank || 0n)}$`, cvvMsg, username, userCardData.cardCvv, userCardData);
+                        const imgPath = `./bank_card_${user}.png`;
+                        fs.writeFileSync(imgPath, img);
+                        await message.reply({ body: formatStyledMessage("", [cvvMsg]), attachment: fs.createReadStream(imgPath) });
+                        fs.unlinkSync(imgPath);
+                    } else await message.reply(formatStyledMessage("", [cvvMsg]));
+                } else return message.reply(formatStyledMessage("", [`❌ ${cardRes.error}`]));
+                break;
+            }
+
+            case "transfer": {
+                let targetUser;
+                if (Object.keys(event.mentions).length > 0) targetUser = Object.keys(event.mentions)[0];
+                else targetUser = args[1];
+                const transferAmount = await parseAmountWithSuffix(args[2]);
+                if (!targetUser) return message.reply(formatStyledMessage("", [`❌ Destinataire manquant. Utilisation: ${p}bank transfer @mention <montant>`]));
+                if (targetUser === user) return message.reply(formatStyledMessage("", ["❌ Auto-transfert interdit."]));
+                if (transferAmount <= 0n) return message.reply(formatStyledMessage("", ["❌ Montant invalide."]));
+                if ((bankData.bank || 0n) < transferAmount) return message.reply(formatStyledMessage("", ["❌ Solde insuffisant."]));
+                if (!bankData.card?.cardCreated) return message.reply(formatStyledMessage("", [`❌ Créez d'abord une carte.`]));
+                let targetName = targetUser;
+                try { const ti = await api.getUserInfo(targetUser); targetName = ti[targetUser]?.name || targetUser; } catch(e) {}
+                clearPendingTransaction(user);
+                pendingTransactions.set(user, { amount: transferAmount, type: "transfer", targetId: targetUser, targetName });
+                savePendingTransactions();
+                const to3 = setTimeout(() => { if (pendingTransactions.has(user)) { pendingTransactions.delete(user); savePendingTransactions(); message.reply(formatStyledMessage("", ["⏰ Transfert expiré."])); } pendingTimeouts.delete(user); }, 15000);
+                pendingTimeouts.set(user, to3);
+                return message.reply(formatStyledMessage("", [`💸 Transfert de ${await formatNumberAsync(transferAmount)}$ vers ${targetName}`, `🔐 Entrez votre CVV (ex: bank 123) [15s]`]));
+            }
+
+            case "gamble":
+            case "bet": {
+                const subGamble = args[1]?.toLowerCase();
+                if (!subGamble || subGamble === "help") {
+                    const helpG = [
+                        "🎰 GAMBLE",
+                        `✰ ${p}bank gamble play <montant> <pile/face>`
+                    ];
+                    return message.reply(formatStyledMessage("", helpG));
+                }
+                if (subGamble === "play") {
+                    const betAmount = await parseAmountWithSuffix(args[2]);
+                    const choice = args[3]?.toLowerCase();
+                    if (betAmount <= 0n) return message.reply(formatStyledMessage("", ["❌ Montant invalide."]));
+                    if (choice !== "pile" && choice !== "face") return message.reply(formatStyledMessage("", ["❌ Choisissez pile ou face."]));
+                    if ((bankData.bank || 0n) < betAmount) return message.reply(formatStyledMessage("", ["❌ Solde insuffisant."]));
+                    const gambleRes = await gambleApi(user, Number(betAmount), choice);
+                    if (gambleRes.success) {
+                        bankData = await getUserBankData(user);
+                        const win = gambleRes.win;
+                        const result = gambleRes.result;
+                        const winAmount = toBigInt(gambleRes.winAmount);
+                        const txt = win ? `🎉 Gagné ! +${await formatNumberAsync(winAmount)}$` : `💀 Perdu ! -${await formatNumberAsync(betAmount)}$`;
+                        if (imageMode !== false) {
+                            const img = await generateGambleCard(username, betAmount, win, winAmount, choice, result);
+                            const imgPath = `./bank_gamble_${user}.png`;
+                            fs.writeFileSync(imgPath, img);
+                            await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                            fs.unlinkSync(imgPath);
+                        } else await message.reply(formatStyledMessage("", [txt]));
+                    } else return message.reply(formatStyledMessage("", [`❌ ${gambleRes.error}`]));
+                }
+                break;
+            }
+
+            case "lottery": {
+                const subLot = args[1]?.toLowerCase();
+                if (!subLot || subLot === "help") {
+                    const helpL = [
+                        "🎲 LOTTERY",
+                        `✰ ${p}bank lottery play <montant>`
+                    ];
+                    return message.reply(formatStyledMessage("", helpL));
+                }
+                if (subLot === "play") {
+                    const ticket = await parseAmountWithSuffix(args[2]);
+                    if (ticket <= 0n) return message.reply(formatStyledMessage("", ["❌ Montant invalide."]));
+                    const userCashBal = await getUserCash(user);
+                    if (ticket > userCashBal) return message.reply(formatStyledMessage("", ["❌ Solde cash insuffisant."]));
+                    const lotteryRes = await playLottery(user, Number(ticket));
+                    if (lotteryRes.success) {
+                        await updateUserCash(user, -ticket);
+                        bankData = await getUserBankData(user);
+                        const win = lotteryRes.win;
+                        const winAmount = toBigInt(lotteryRes.winAmount || 0);
+                        const txt = win ? `🎉 Gain: +${await formatNumberAsync(winAmount)}$` : `💀 Perte: -${await formatNumberAsync(ticket)}$`;
+                        if (imageMode !== false) {
+                            const img = await generateLotteryCard(username, ticket, win, winAmount, lotteryRes.userNumbers, lotteryRes.drawnNumbers, lotteryRes.matchCount);
+                            const imgPath = `./bank_lottery_${user}.png`;
+                            fs.writeFileSync(imgPath, img);
+                            await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                            fs.unlinkSync(imgPath);
+                        } else await message.reply(formatStyledMessage("", [txt]));
+                    } else return message.reply(formatStyledMessage("", [`❌ ${lotteryRes.error}`]));
+                }
+                break;
+            }
+
+            case "parrainage":
+            case "parrain": {
+                const subPar = args[1]?.toLowerCase();
+                if (!subPar || subPar === "help") {
+                    const helpP = [
+                        "🎁 PARRAINAGE",
+                        `✰ ${p}bank parrainage creer`,
+                        `✰ ${p}bank parrainage utiliser <code>`
+                    ];
+                    return message.reply(formatStyledMessage("", helpP));
+                }
+                if (subPar === "creer" || subPar === "create") {
+                    const codeRes = await createParrainCode(user);
+                    if (codeRes.success) {
+                        const txt = `🔑 Votre code: ${codeRes.code}`;
+                        if (imageMode !== false) {
+                            const img = await generateParrainCard(username, codeRes.code, 0, 0, "create");
+                            const imgPath = `./bank_parrain_${user}.png`;
+                            fs.writeFileSync(imgPath, img);
+                            await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                            fs.unlinkSync(imgPath);
+                        } else await message.reply(formatStyledMessage("", [txt]));
+                    } else return message.reply(formatStyledMessage("", [`❌ ${codeRes.error}`]));
+                } else if (subPar === "utiliser" || subPar === "use") {
+                    const code = args[2];
+                    if (!code) return message.reply(formatStyledMessage("", ["❌ Code manquant."]));
+                    const useRes = await useParrainCode(user, code);
+                    if (useRes.success) {
+                        bankData = await getUserBankData(user);
+                        const txt = `🎉 Bonus 10000$ ajouté ! Nouveau solde: ${await formatNumberAsync(bankData.bank)}$`;
+                        if (imageMode !== false) {
+                            const img = await generateParrainCard(username, code, 0, 0, "use");
+                            const imgPath = `./bank_parrain_use_${user}.png`;
+                            fs.writeFileSync(imgPath, img);
+                            await message.reply({ body: formatStyledMessage("", [txt]), attachment: fs.createReadStream(imgPath) });
+                            fs.unlinkSync(imgPath);
+                        } else await message.reply(formatStyledMessage("", [txt]));
+                    } else return message.reply(formatStyledMessage("", [`❌ ${useRes.error}`]));
+                }
+                break;
+            }
+
+            case "image": {
+                const subImg = args[1]?.toLowerCase();
+                if (subImg === "on") {
+                    imageMode = true;
+                    return message.reply(formatStyledMessage("", ["🖼️ Mode carte activé."]));
+                } else if (subImg === "off") {
+                    imageMode = false;
+                    return message.reply(formatStyledMessage("", ["📝 Mode texte activé."]));
+                } else return message.reply(formatStyledMessage("", [`🖼️ Utilisez ${p}bank image on/off`]));
+            }
+
+            default: {
+                const helpMain = [
+                    "🏦 HEDGEHOG BANK 🏦",
+                    "━━━━━━━━━━━━━━━━",
+                    `✰ ${p}bank deposit`,
+                    `✰ ${p}bank withdraw`,
+                    `✰ ${p}bank balance`,
+                    `✰ ${p}bank interest`,
+                    `✰ ${p}bank transfer`,
+                    `✰ ${p}bank gamble play`,
+                    `✰ ${p}bank lottery play`,
+                    `✰ ${p}bank parrainage`,
+                    `✰ ${p}bank card`,
+                    `✰ ${p}bank image on/off`,
+                    `✰ ${p}bank top`,
+                    `✰ ${p}bank history`,
+                    `✰ ${p}bank rob`,
+                    `✰ ${p}bank vip -a/-r/list`,
+                    "━━━━━━━━━━━━━━━━",
+                    "MERCI POUR VOTRE CONTRIBUTION !"
+                ];
+                return message.reply(formatStyledMessage("", helpMain));
+            }
+        }
     }
-  }
 };
